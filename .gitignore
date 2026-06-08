@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+
+# Model weights & large files
+*.pth
+*.onnx
+*.onnx.data
+
+# Generated dataset (too large for git)
+dataset/
+
+# Training outputs
+confusion_matrix.png
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Trae internal
+.trae/
+
+# Misc
+check_dataset.py
