@@ -1,13 +1,15 @@
 """
 oblique_generator.py
-用于生成 Oasis-Map-Orientation-Surveyor 模型的斜视卫星图训练数据。
-从多个公开地图服务下载斜视/倾斜摄影卫星图，进行随机旋转、裁剪，
-模拟瓦片交界缝隙，最终按相对旋转方向（0-7）分类存储。
+用于生成 Oasis-Map-Orientation-Surveyor 模型的卫星图旋转分类训练数据。
+从多个公开卫星图服务下载地图切片，进行显式旋转、随机裁剪和域随机化，
+按旋转方向（0-7）分类存储。
 
-斜视卫星图特点：
-- 从45度角拍摄，能看到建筑物侧面
-- 有明确的朝向（北、东北、东、东南等8个方向）
-- 用于3D重建时提供立面信息
+v3 优化：
+- 去掉瓦片缝隙模拟（真实截图不会有瓦片边界）
+- 增强域随机化（模糊、锐化、色彩偏移等）
+- 改用 OpenCV 旋转（更接近真实截图工具）
+- 标签 = 旋转角度（target_class * 45°），语义一致
+- 每个类别使用多个城市、多个地图源、多个 zoom 级别
 """
 
 import os
@@ -19,83 +21,120 @@ from pathlib import Path
 from typing import Tuple, Optional
 
 import numpy as np
-from PIL import Image, ImageDraw
+import cv2
+from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 import requests
 from tqdm import tqdm
 
 
 # ==================== 配置参数 ====================
 
-# 多地图源配置（支持斜视/倾斜摄影）
+# 纯卫星图源（Esri 最稳定放前面，Google 在中国可能超时）
 TILE_SOURCES = [
-    {
-        "name": "Google Satellite",
-        "url": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-        "type": "satellite",
-    },
-    {
-        "name": "Google Hybrid",
-        "url": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-        "type": "hybrid",
-    },
     {
         "name": "Esri World Imagery",
         "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        "type": "satellite",
     },
     {
         "name": "Bing Aerial",
         "url": "https://t0.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=1",
-        "type": "satellite",
         "use_quadkey": True,
     },
     {
-        "name": "CartoDB Dark",
-        "url": "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-        "subdomains": ["a", "b", "c", "d"],
-        "type": "map",
+        "name": "Google Satellite",
+        "url": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+    },
+    {
+        "name": "Google Satellite (mt2)",
+        "url": "https://mt2.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+    },
+    {
+        "name": "Google Satellite (mt3)",
+        "url": "https://mt3.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
     },
 ]
 
 TILE_SIZE = 256
 MAX_ZOOM = 19
-MIN_ZOOM = 16  # 斜视图需要更高zoom
+MIN_ZOOM = 15
 
 # 数据生成配置
-TARGET_CLASSES = 8  # 0-7 对应 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°
-IMAGES_PER_CLASS_TRAIN = 300
-IMAGES_PER_CLASS_VAL = 100
+TARGET_CLASSES = 8
+IMAGES_PER_CLASS_TRAIN = 1000
+IMAGES_PER_CLASS_VAL = 200
+CITIES_PER_CLASS = 8
+IMAGES_PER_CITY_TRAIN = IMAGES_PER_CLASS_TRAIN // CITIES_PER_CLASS  # 125
+IMAGES_PER_CITY_VAL = IMAGES_PER_CLASS_VAL // CITIES_PER_CLASS      # 25
+ZOOM_LEVELS = [15, 16, 17, 18, 19]
 
 # 图像尺寸配置
 CROP_SIZE_MIN = 512
 CROP_SIZE_MAX = 1024
 FINAL_SAVE_SIZE = 512
 
-# 瓦片缝隙模拟配置
-SEAM_PROBABILITY = 0.7
-SEAM_COUNT_MIN = 1
-SEAM_COUNT_MAX = 2
-SEAM_COLOR_RANGE = ((80, 80, 80), (40, 40, 40))
-SEAM_WIDTH_MIN = 1
-SEAM_WIDTH_MAX = 3
-
 # 输出目录
 OUTPUT_DIR = Path("e:/github projects/OasisCompany/Oasis-Map-Orientation-Surveyor/dataset")
 
 # 请求配置
-REQUEST_TIMEOUT = 30
-REQUEST_DELAY = 0.5
+REQUEST_TIMEOUT = 15
+REQUEST_DELAY = 0.1
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
-
 MAX_RETRIES = 3
+
+# 40+ 全球城市，覆盖不同地形和建筑风格
+GLOBAL_CITIES = [
+    # 中国
+    (39.9042, 116.4074),   # 北京
+    (31.2304, 121.4737),   # 上海
+    (30.5728, 104.0668),   # 成都
+    (23.1291, 113.2644),   # 广州
+    (29.5630, 106.5516),   # 重庆
+    (34.3416, 108.9398),   # 西安
+    (36.0671, 120.3826),   # 青岛
+    (26.0745, 119.2965),   # 福州
+    (45.8038, 126.5350),   # 哈尔滨
+    (43.8256, 87.6168),    # 乌鲁木齐
+    (22.5431, 114.0579),   # 深圳
+    (30.2741, 120.1551),   # 杭州
+    # 亚洲
+    (35.6762, 139.6503),   # Tokyo
+    (37.5665, 126.9780),   # Seoul
+    (22.3193, 114.1694),   # Hong Kong
+    (1.3521, 103.8198),    # Singapore
+    (13.7563, 100.5018),   # Bangkok
+    (19.0760, 72.8777),    # Mumbai
+    (28.6139, 77.2090),    # New Delhi
+    # 欧洲
+    (48.8566, 2.3522),     # Paris
+    (51.5074, -0.1278),    # London
+    (52.5200, 13.4050),    # Berlin
+    (41.9028, 12.4964),    # Rome
+    (40.4168, -3.7038),    # Madrid
+    (59.3293, 18.0686),    # Stockholm
+    (55.7558, 37.6173),    # Moscow
+    (50.0755, 14.4378),    # Prague
+    # 北美
+    (40.7128, -74.0060),   # New York
+    (34.0522, -118.2437),  # Los Angeles
+    (37.7749, -122.4194),  # San Francisco
+    (41.8781, -87.6298),   # Chicago
+    (25.7617, -80.1918),   # Miami
+    (43.6532, -79.3832),   # Toronto
+    # 南美/大洋洲/中东/非洲
+    (-33.8688, 151.2093),  # Sydney
+    (-23.5505, -46.6333),  # Sao Paulo
+    (25.2048, 55.2708),    # Dubai
+    (30.0444, 31.2357),    # Cairo
+    (-1.2921, 36.8219),    # Nairobi
+    (6.5244, 3.3792),      # Lagos
+]
 
 
 # ==================== 坐标转换工具 ====================
 
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
-    """将经纬度转换为瓦片坐标 (x, y)。"""
     lat_rad = math.radians(lat_deg)
     n = 2.0 ** zoom
     xtile = int((lon_deg + 180.0) / 360.0 * n)
@@ -103,17 +142,7 @@ def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
     return xtile, ytile
 
 
-def num2deg(xtile: int, ytile: int, zoom: int) -> Tuple[float, float]:
-    """将瓦片坐标转换为左上角的经纬度。"""
-    n = 2.0 ** zoom
-    lon_deg = xtile / n * 360.0 - 180.0
-    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile / n)))
-    lat_deg = math.degrees(lat_rad)
-    return lat_deg, lon_deg
-
-
 def tile_xy_to_quadkey(x: int, y: int, z: int) -> str:
-    """将瓦片坐标转换为 Bing Maps 的 quadkey。"""
     quadkey = ""
     for i in range(z, 0, -1):
         digit = 0
@@ -129,41 +158,28 @@ def tile_xy_to_quadkey(x: int, y: int, z: int) -> str:
 # ==================== 地图切片下载 ====================
 
 def get_tile_url(source_idx: int, x: int, y: int, z: int) -> str:
-    """根据地图源索引生成瓦片 URL。"""
     source = TILE_SOURCES[source_idx % len(TILE_SOURCES)]
     url = source["url"]
-    
     if source.get("use_quadkey"):
         quadkey = tile_xy_to_quadkey(x, y, z)
         url = url.replace("{quadkey}", quadkey)
     else:
-        if source.get("subdomains"):
-            subdomain = random.choice(source["subdomains"])
-            url = url.replace("{s}", subdomain)
-        else:
-            url = url.replace("{s}.", "")
         url = url.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
-    
     return url
 
 
 def download_tile(x: int, y: int, z: int, source_idx: int = 0, retries: int = MAX_RETRIES) -> Optional[Image.Image]:
-    """下载单个地图瓦片，支持多源切换。"""
     for attempt in range(retries):
         try:
             current_source_idx = (source_idx + attempt) % len(TILE_SOURCES)
             url = get_tile_url(current_source_idx, x, y, z)
-            
             response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
-            
             content_type = response.headers.get("Content-Type", "")
             if "image" not in content_type:
-                print(f"非图片响应 ({x}, {y}, {z}): {content_type}")
                 if attempt < retries - 1:
                     continue
                 return None
-            
             image = Image.open(io.BytesIO(response.content)).convert("RGB")
             time.sleep(REQUEST_DELAY)
             return image
@@ -171,288 +187,259 @@ def download_tile(x: int, y: int, z: int, source_idx: int = 0, retries: int = MA
             if attempt < retries - 1:
                 time.sleep(1.0 * (attempt + 1))
             else:
-                print(f"下载瓦片失败 ({x}, {y}, {z}): {e}")
+                print(f"Download failed ({x}, {y}, {z}): {e}")
                 return None
     return None
 
 
 def download_map_region(
-    center_lat: float,
-    center_lon: float,
-    zoom: int,
-    tiles_x: int = 5,
-    tiles_y: int = 5,
-    source_idx: int = 0
+    center_lat: float, center_lon: float, zoom: int,
+    tiles_x: int = 3, tiles_y: int = 3, source_idx: int = 0
 ) -> Optional[Image.Image]:
-    """下载指定区域的地图瓦片并拼接成一张大图。"""
     center_x, center_y = deg2num(center_lat, center_lon, zoom)
-    
     start_x = center_x - tiles_x // 2
     start_y = center_y - tiles_y // 2
-    
     total_width = tiles_x * TILE_SIZE
     total_height = tiles_y * TILE_SIZE
-    
     big_image = Image.new("RGB", (total_width, total_height), color=(30, 30, 30))
-    
+
     source_name = TILE_SOURCES[source_idx % len(TILE_SOURCES)]["name"]
-    print(f"正在下载卫星图区域: 中心 ({center_lat:.4f}, {center_lon:.4f}), Zoom={zoom}, 源={source_name}")
-    
+    print(f"  Downloading ({center_lat:.4f}, {center_lon:.4f}) Z{zoom} [{source_name}]")
+
     success_count = 0
     for dy in range(tiles_y):
         for dx in range(tiles_x):
-            tile_x = start_x + dx
-            tile_y = start_y + dy
-            
-            tile = download_tile(tile_x, tile_y, zoom, source_idx=source_idx)
+            tile = download_tile(start_x + dx, start_y + dy, zoom, source_idx=source_idx)
             if tile is not None:
-                paste_x = dx * TILE_SIZE
-                paste_y = dy * TILE_SIZE
-                big_image.paste(tile, (paste_x, paste_y))
+                big_image.paste(tile, (dx * TILE_SIZE, dy * TILE_SIZE))
                 success_count += 1
-    
-    print(f"瓦片下载成功: {success_count}/{tiles_x * tiles_y}")
-    
+
     if success_count < (tiles_x * tiles_y) * 0.5:
-        print(f"瓦片下载成功率过低，放弃此区域")
+        print(f"  Success rate too low ({success_count}/{tiles_x*tiles_y}), skipping")
         return None
-    
+
     return big_image
 
 
-# ==================== 斜视效果模拟 ====================
-
-def simulate_oblique_view(image: Image.Image, direction: int) -> Image.Image:
-    """
-    模拟斜视效果（倾斜摄影）。
-    direction: 0=北, 1=东北, 2=东, 3=东南, 4=南, 5=西南, 6=西, 7=西北
-    通过透视变换模拟从该方向45度角观察的效果。
-    """
-    width, height = image.size
-    
-    # 定义透视变换矩阵，模拟从不同方向斜视
-    # 这里使用简化的透视变换，实际倾斜摄影需要更复杂的3D变换
-    
-    # 根据方向确定倾斜轴
-    if direction in [0, 4]:  # 北/南 - 沿Y轴倾斜
-        # 模拟从北或南方向看
-        tilt_factor = 0.3 if direction == 0 else -0.3
-        coeffs = (
-            1.0, 0.0, 0.0,
-            tilt_factor, 0.7, 0.0,
-            0.0, 0.0, 1.0
-        )
-    elif direction in [2, 6]:  # 东/西 - 沿X轴倾斜
-        tilt_factor = -0.3 if direction == 2 else 0.3
-        coeffs = (
-            0.7, tilt_factor, 0.0,
-            0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0
-        )
-    elif direction in [1, 5]:  # 东北/西南 - 对角线倾斜
-        tilt_x = -0.2 if direction == 1 else 0.2
-        tilt_y = 0.2 if direction == 1 else -0.2
-        coeffs = (
-            0.8, tilt_x, 0.0,
-            tilt_y, 0.8, 0.0,
-            0.0, 0.0, 1.0
-        )
-    else:  # 东南/西北
-        tilt_x = 0.2 if direction == 3 else -0.2
-        tilt_y = 0.2 if direction == 3 else -0.2
-        coeffs = (
-            0.8, tilt_x, 0.0,
-            tilt_y, 0.8, 0.0,
-            0.0, 0.0, 1.0
-        )
-    
-    # 应用透视变换
-    oblique = image.transform(
-        (width, height),
-        Image.Transform.PERSPECTIVE,
-        coeffs,
-        Image.Resampling.BILINEAR,
-        fillcolor=(20, 20, 20)
-    )
-    
-    return oblique
-
-
-# ==================== 数据增强与合成 ====================
+# ==================== 数据变换 ====================
 
 def rotate_image(image: Image.Image, angle: float) -> Image.Image:
-    """对图像进行指定角度的旋转。"""
-    return image.rotate(angle, resample=Image.Resampling.BILINEAR, expand=False, fillcolor=(20, 20, 20))
+    """
+    使用 OpenCV 进行旋转，更接近真实截图的变换方式。
+    相比 PIL rotate，OpenCV 的 warpAffine 插值实现不同，
+    可减少合成数据与真实数据之间的插值差异。
+    """
+    # PIL -> numpy (RGB)
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+    center = (w // 2, h // 2)
+
+    # 获取旋转矩阵
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+    # 计算旋转后图像尺寸（保持完整内容）
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+
+    # 调整旋转矩阵中心点
+    M[0, 2] += (new_w / 2) - center[0]
+    M[1, 2] += (new_h / 2) - center[1]
+
+    # 执行旋转
+    rotated = cv2.warpAffine(
+        img_array, M, (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(20, 20, 20)
+    )
+
+    # numpy -> PIL
+    return Image.fromarray(rotated)
 
 
 def random_crop(image: Image.Image, crop_size: int) -> Image.Image:
-    """从图像中随机裁剪指定大小的区域。"""
     width, height = image.size
     if crop_size >= width or crop_size >= height:
         return image.resize((crop_size, crop_size), Image.Resampling.BILINEAR)
-    
-    max_x = width - crop_size
-    max_y = height - crop_size
-    x = random.randint(0, max_x)
-    y = random.randint(0, max_y)
-    
+    x = random.randint(0, width - crop_size)
+    y = random.randint(0, height - crop_size)
     return image.crop((x, y, x + crop_size, y + crop_size))
 
 
 def add_tile_seams(image: Image.Image) -> Image.Image:
-    """在图像上随机添加 1-2 条灰色/黑色细线，模拟瓦片交界缝隙。"""
-    if random.random() > SEAM_PROBABILITY:
-        return image
-    
+    """瓦片缝隙模拟已禁用 — 真实截图不会有瓦片边界。"""
+    return image
+
+
+def apply_domain_randomization(image: Image.Image) -> Image.Image:
+    """增强域随机化：模拟更丰富的真实采集条件变化。"""
     img = image.copy()
-    draw = ImageDraw.Draw(img)
-    width, height = img.size
-    
-    num_seams = random.randint(SEAM_COUNT_MIN, SEAM_COUNT_MAX)
-    
-    for _ in range(num_seams):
-        color = (
-            random.randint(SEAM_COLOR_RANGE[1][0], SEAM_COLOR_RANGE[0][0]),
-            random.randint(SEAM_COLOR_RANGE[1][1], SEAM_COLOR_RANGE[0][1]),
-            random.randint(SEAM_COLOR_RANGE[1][2], SEAM_COLOR_RANGE[0][2]),
-        )
-        line_width = random.randint(SEAM_WIDTH_MIN, SEAM_WIDTH_MAX)
-        
-        if random.random() > 0.5:
-            y = random.randint(0, height)
-            draw.line([(0, y), (width, y)], fill=color, width=line_width)
-        else:
-            x = random.randint(0, width)
-            draw.line([(x, 0), (x, height)], fill=color, width=line_width)
-    
+
+    # 1. 随机亮度/对比度/饱和度
+    if random.random() > 0.2:
+        brightness = random.uniform(0.6, 1.4)
+        contrast = random.uniform(0.6, 1.4)
+        saturation = random.uniform(0.6, 1.4)
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(brightness)
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(contrast)
+        enhancer = ImageEnhance.Color(img)
+        img = enhancer.enhance(saturation)
+
+    # 2. 随机高斯模糊 (模拟低分辨率/失焦)
+    if random.random() > 0.5:
+        radius = random.uniform(0.3, 2.0)
+        img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    # 3. 随机锐化 (模拟过度锐化的图像)
+    if random.random() > 0.7:
+        img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+
+    # 4. 随机色彩偏移 (模拟不同传感器白平衡)
+    if random.random() > 0.6:
+        img_array = np.array(img, dtype=np.float32)
+        for c in range(3):
+            shift = random.uniform(-15, 15)
+            img_array[:, :, c] = np.clip(img_array[:, :, c] + shift, 0, 255)
+        img = Image.fromarray(img_array.astype(np.uint8))
+
+    # 5. 随机高斯噪声
+    if random.random() > 0.4:
+        img_array = np.array(img, dtype=np.float32)
+        noise = np.random.normal(0, random.uniform(2, 15), img_array.shape)
+        img_array = np.clip(img_array + noise, 0, 255)
+        img = Image.fromarray(img_array.astype(np.uint8))
+
+    # 6. 随机 JPEG 压缩
+    if random.random() > 0.3:
+        quality = random.randint(50, 95)
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=quality)
+        buffer.seek(0)
+        img = Image.open(buffer).convert("RGB")
+
+    # 7. 随机色调偏移 (模拟不同时间拍摄)
+    if random.random() > 0.8:
+        img_array = np.array(img, dtype=np.float32)
+        img_array = np.clip(img_array * random.uniform(0.9, 1.1), 0, 255)
+        img = Image.fromarray(img_array.astype(np.uint8))
+
     return img
 
 
 def apply_random_transformations(image: Image.Image, target_class: int) -> Image.Image:
     """
-    应用随机变换：斜视模拟、旋转、裁剪、添加缝隙。
-    target_class: 0-7，对应 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°
+    纯旋转任务：标签 = target_class * 45°。
+    不做斜视模拟，不做随机旋转，保证标签语义一致。
     """
-    # 1. 模拟斜视效果（方向由 target_class 决定）
-    oblique = simulate_oblique_view(image, target_class)
-    
-    # 2. 旋转（模拟用户截图时的随机旋转）
-    angle = random.choice([0, 45, 90, 135, 180, 225, 270, 315])
-    rotated = rotate_image(oblique, angle)
-    
-    # 3. 随机裁剪
-    crop_size = random.randint(CROP_SIZE_MIN, min(CROP_SIZE_MAX, image.size[0], image.size[1]))
-    cropped = random_crop(rotated, crop_size)
-    
-    # 4. 添加瓦片缝隙
-    with_seams = add_tile_seams(cropped)
-    
-    # 5. 调整最终尺寸
-    final = with_seams.resize((FINAL_SAVE_SIZE, FINAL_SAVE_SIZE), Image.Resampling.BILINEAR)
-    
+    angle = target_class * 45.0
+    rotated = rotate_image(image, angle)
+
+    # 从旋转后图像中心区域裁剪，避免黑色边界
+    crop_size = random.randint(CROP_SIZE_MIN, min(CROP_SIZE_MAX, rotated.size[0], rotated.size[1]))
+    width, height = rotated.size
+
+    # 计算安全裁剪区域（避开可能的黑色边界）
+    orig_w, orig_h = image.size
+    margin_x = max(0, (width - orig_w) // 2)
+    margin_y = max(0, (height - orig_h) // 2)
+
+    min_x = margin_x
+    max_x = width - crop_size - margin_x
+    min_y = margin_y
+    max_y = height - crop_size - margin_y
+
+    if max_x > min_x and max_y > min_y:
+        x = random.randint(min_x, max_x)
+        y = random.randint(min_y, max_y)
+    else:
+        x = random.randint(0, max(0, width - crop_size))
+        y = random.randint(0, max(0, height - crop_size))
+
+    cropped = rotated.crop((x, y, x + crop_size, y + crop_size))
+    randomized = apply_domain_randomization(cropped)
+    final = randomized.resize((FINAL_SAVE_SIZE, FINAL_SAVE_SIZE), Image.Resampling.BILINEAR)
     return final
 
 
 # ==================== 数据集生成主逻辑 ====================
 
 def create_directory_structure():
-    """创建数据集目录结构。"""
-    splits = ["train", "val"]
-    for split in splits:
+    for split in ["train", "val"]:
         for class_idx in range(TARGET_CLASSES):
-            dir_path = OUTPUT_DIR / split / str(class_idx)
-            dir_path.mkdir(parents=True, exist_ok=True)
-    print(f"目录结构已创建: {OUTPUT_DIR}")
+            (OUTPUT_DIR / split / str(class_idx)).mkdir(parents=True, exist_ok=True)
+    print(f"Directory structure created: {OUTPUT_DIR}")
 
 
 def generate_synthetic_dataset():
-    """主函数：生成完整的斜视卫星图合成数据集。"""
     create_directory_structure()
-    
-    # 城市中心坐标（选择有高楼建筑的城市，斜视效果更明显）
-    city_centers = [
-        (39.9042, 116.4074),   # 北京
-        (31.2304, 121.4737),   # 上海
-        (30.5728, 104.0668),   # 成都
-        (23.1291, 113.2644),   # 广州
-        (29.5630, 106.5516),   # 重庆
-        (34.3416, 108.9398),   # 西安
-        (36.0671, 120.3826),   # 青岛
-        (26.0745, 119.2965),   # 福州
-        (45.8038, 126.5350),   # 哈尔滨
-        (43.8256, 87.6168),    # 乌鲁木齐
-    ]
-    
+
     total_train = IMAGES_PER_CLASS_TRAIN * TARGET_CLASSES
     total_val = IMAGES_PER_CLASS_VAL * TARGET_CLASSES
-    
-    print(f"计划生成数据: {total_train} 张训练 + {total_val} 张验证 = {total_train + total_val} 张")
-    print(f"使用地图源: {[s['name'] for s in TILE_SOURCES]}")
-    
+    print(f"Target: {total_train} train + {total_val} val = {total_train + total_val} images")
+    print(f"Cities per class: {CITIES_PER_CLASS}, Total cities available: {len(GLOBAL_CITIES)}")
+    print(f"Zoom levels: {ZOOM_LEVELS}")
+    print(f"Sources: {[s['name'] for s in TILE_SOURCES]}")
+
+    global_counter = [0]  # 用列表包装以在嵌套函数中修改
+
     for class_idx in range(TARGET_CLASSES):
-        print(f"\n正在生成分类 {class_idx} (方向 {class_idx * 45}°) 的数据...")
-        
-        city_idx = class_idx % len(city_centers)
-        center_lat, center_lon = city_centers[city_idx]
-        zoom = random.randint(MIN_ZOOM, MAX_ZOOM)
-        
-        source_idx = class_idx % len(TILE_SOURCES)
-        base_map = download_map_region(center_lat, center_lon, zoom, tiles_x=5, tiles_y=5, source_idx=source_idx)
-        
-        if base_map is None:
-            print(f"无法下载地图区域，跳过类别 {class_idx}")
-            continue
-        
-        # 生成训练集
-        for i in tqdm(range(IMAGES_PER_CLASS_TRAIN), desc=f"类别 {class_idx} 训练集"):
-            transformed = apply_random_transformations(base_map, class_idx)
-            save_path = OUTPUT_DIR / "train" / str(class_idx) / f"{class_idx}_{i:04d}.png"
-            transformed.save(save_path, "PNG")
-        
-        # 生成验证集
-        for i in tqdm(range(IMAGES_PER_CLASS_VAL), desc=f"类别 {class_idx} 验证集"):
-            transformed = apply_random_transformations(base_map, class_idx)
-            save_path = OUTPUT_DIR / "val" / str(class_idx) / f"{class_idx}_{i:04d}.png"
-            transformed.save(save_path, "PNG")
-        
-        del base_map
-    
-    print(f"\n数据生成完成！保存在: {OUTPUT_DIR}")
+        print(f"\n{'='*50}")
+        print(f"Class {class_idx} ({class_idx * 45}°)")
+        print(f"{'='*50}")
+
+        selected_cities = random.sample(GLOBAL_CITIES, min(CITIES_PER_CLASS, len(GLOBAL_CITIES)))
+
+        for city_idx, (lat, lon) in enumerate(selected_cities):
+            zoom = random.choice(ZOOM_LEVELS)
+            source_idx = random.choice([0, 0, 0, 1, 1, 2])  # 优先 Esri/Bing
+
+            base_map = download_map_region(lat, lon, zoom, source_idx=source_idx)
+            if base_map is None:
+                continue
+
+            # 训练集
+            for i in tqdm(range(IMAGES_PER_CITY_TRAIN), desc=f"  C{class_idx} train [{city_idx+1}/{len(selected_cities)}]", leave=False):
+                transformed = apply_random_transformations(base_map, class_idx)
+                save_path = OUTPUT_DIR / "train" / str(class_idx) / f"{class_idx}_{global_counter[0]:05d}.png"
+                transformed.save(save_path, "PNG")
+                global_counter[0] += 1
+
+            # 验证集
+            for i in tqdm(range(IMAGES_PER_CITY_VAL), desc=f"  C{class_idx} val [{city_idx+1}/{len(selected_cities)}]", leave=False):
+                transformed = apply_random_transformations(base_map, class_idx)
+                save_path = OUTPUT_DIR / "val" / str(class_idx) / f"{class_idx}_{global_counter[0]:05d}.png"
+                transformed.save(save_path, "PNG")
+                global_counter[0] += 1
+
+            del base_map
+
+    print(f"\nData generation complete: {OUTPUT_DIR}")
     print_summary()
 
 
 def print_summary():
-    """打印数据集统计信息。"""
     print("\n" + "=" * 50)
-    print("数据集生成统计")
+    print("Dataset Statistics")
     print("=" * 50)
-    
     for split in ["train", "val"]:
-        split_dir = OUTPUT_DIR / split
-        if not split_dir.exists():
-            continue
-        
-        total_images = 0
+        total = 0
         for class_idx in range(TARGET_CLASSES):
-            class_dir = split_dir / str(class_idx)
-            if class_dir.exists():
-                count = len(list(class_dir.glob("*.png")))
-                total_images += count
-                print(f"  {split}/{class_idx}: {count} 张")
-        
-        print(f"  {split} 总计: {total_images} 张")
-    
+            count = len(list((OUTPUT_DIR / split / str(class_idx)).glob("*.png")))
+            total += count
+            print(f"  {split}/{class_idx} ({class_idx*45}°): {count}")
+        print(f"  {split} total: {total}")
     print("=" * 50)
 
-
-# ==================== 入口 ====================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Oasis-Map-Orientation-Surveyor 斜视卫星图合成数据生成器")
+    print("Oasis-Map-Orientation-Surveyor Data Generator (v3)")
+    print("Domain gap reduction: no seams, enhanced randomization, OpenCV rotate")
     print("=" * 60)
-    
     random.seed(42)
     np.random.seed(42)
-    
     generate_synthetic_dataset()

@@ -1,17 +1,17 @@
 {
-  "overall_accuracy": 0.1225,
-  "mean_class_accuracy": 0.12250000000000001,
-  "min_class_accuracy": 0.0,
+  "overall_accuracy": 0.1525,
+  "mean_class_accuracy": 0.15250000000000002,
+  "min_class_accuracy": 0.04,
   "per_class_accuracy": {
-    "0deg": 0.46,
-    "45deg": 0.1,
-    "90deg": 0.02,
-    "135deg": 0.32,
-    "180deg": 0.0,
-    "225deg": 0.0,
-    "270deg": 0.0,
-    "315deg": 0.08
+    "0deg": 0.2,
+    "45deg": 0.26,
+    "90deg": 0.24,
+    "135deg": 0.06,
+    "180deg": 0.12,
+    "225deg": 0.04,
+    "270deg": 0.16,
+    "315deg": 0.14
   },
   "total_samples": 400,
-  "mean_confidence": 0.47629726365208624
+  "mean_confidence": 0.5549523359164595
 }

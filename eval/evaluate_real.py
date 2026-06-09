@@ -16,7 +16,7 @@ from tqdm import tqdm
 # ImageNet 标准归一化参数
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
-IMAGE_SIZE = 224
+IMAGE_SIZE = 256
 CLASSES = [f"{i*45}°" for i in range(8)]
 
 

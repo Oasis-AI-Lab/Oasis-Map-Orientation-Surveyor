@@ -13,9 +13,12 @@ venv/
 
 # Generated dataset (too large for git)
 dataset/
+dataset_raw/
+dataset_real_labeled/
 
 # Training outputs
-confusion_matrix.png
+outputs/
+*.png
 
 # IDE / OS
 .vscode/

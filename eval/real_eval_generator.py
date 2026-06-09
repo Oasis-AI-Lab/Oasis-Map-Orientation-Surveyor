@@ -3,11 +3,9 @@ real_eval_generator.py
 从在线地图服务下载真实卫星图，生成带已知旋转方向的测试集。
 用于评估模型在真实数据上的表现。
 
-策略：
-1. 下载真实卫星图大图
-2. 对每张大图进行 8 个方向的显式旋转（0°, 45°, ..., 315°）
-3. 随机裁剪 + 添加瓦片缝隙（与训练数据分布一致）
-4. 按真实旋转方向存入 test/0-7 目录
+v3 优化：
+- 去掉瓦片缝隙模拟（真实截图不会有瓦片边界）
+- 改用 OpenCV 旋转（与训练一致）
 """
 
 import os
@@ -19,6 +17,7 @@ from pathlib import Path
 from typing import Tuple, Optional
 
 import numpy as np
+import cv2
 from PIL import Image, ImageDraw
 import requests
 from tqdm import tqdm
@@ -26,13 +25,8 @@ from tqdm import tqdm
 
 # ==================== 配置参数 ====================
 
-# 多地图源配置
+# 多地图源配置（Esri 优先，Google 在中国可能超时）
 TILE_SOURCES = [
-    {
-        "name": "Google Satellite",
-        "url": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-        "type": "satellite",
-    },
     {
         "name": "Esri World Imagery",
         "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -43,6 +37,11 @@ TILE_SOURCES = [
         "url": "https://t0.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=1",
         "type": "satellite",
         "use_quadkey": True,
+    },
+    {
+        "name": "Google Satellite",
+        "url": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+        "type": "satellite",
     },
 ]
 
@@ -57,20 +56,12 @@ CROP_SIZE_MIN = 512
 CROP_SIZE_MAX = 1024
 FINAL_SAVE_SIZE = 512
 
-# 瓦片缝隙模拟配置
-SEAM_PROBABILITY = 0.7
-SEAM_COUNT_MIN = 1
-SEAM_COUNT_MAX = 2
-SEAM_COLOR_RANGE = ((80, 80, 80), (40, 40, 40))
-SEAM_WIDTH_MIN = 1
-SEAM_WIDTH_MAX = 3
-
 # 输出目录
 OUTPUT_DIR = Path("e:/github projects/OasisCompany/Oasis-Map-Orientation-Surveyor/dataset_real_test")
 
 # 请求配置
-REQUEST_TIMEOUT = 30
-REQUEST_DELAY = 0.5
+REQUEST_TIMEOUT = 15
+REQUEST_DELAY = 0.1
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -141,8 +132,8 @@ def download_map_region(
     center_lat: float,
     center_lon: float,
     zoom: int,
-    tiles_x: int = 5,
-    tiles_y: int = 5,
+    tiles_x: int = 3,
+    tiles_y: int = 3,
     source_idx: int = 0
 ) -> Optional[Image.Image]:
     center_x, center_y = deg2num(center_lat, center_lon, zoom)
@@ -175,7 +166,29 @@ def download_map_region(
 # ==================== 数据变换 ====================
 
 def rotate_image(image: Image.Image, angle: float) -> Image.Image:
-    return image.rotate(angle, resample=Image.Resampling.BILINEAR, expand=False, fillcolor=(20, 20, 20))
+    """使用 OpenCV 旋转，与训练数据生成一致。"""
+    img_array = np.array(image)
+    h, w = img_array.shape[:2]
+    center = (w // 2, h // 2)
+
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+
+    M[0, 2] += (new_w / 2) - center[0]
+    M[1, 2] += (new_h / 2) - center[1]
+
+    rotated = cv2.warpAffine(
+        img_array, M, (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(20, 20, 20)
+    )
+
+    return Image.fromarray(rotated)
 
 
 def random_crop(image: Image.Image, crop_size: int) -> Image.Image:
@@ -190,26 +203,8 @@ def random_crop(image: Image.Image, crop_size: int) -> Image.Image:
 
 
 def add_tile_seams(image: Image.Image) -> Image.Image:
-    if random.random() > SEAM_PROBABILITY:
-        return image
-    img = image.copy()
-    draw = ImageDraw.Draw(img)
-    width, height = img.size
-    num_seams = random.randint(SEAM_COUNT_MIN, SEAM_COUNT_MAX)
-    for _ in range(num_seams):
-        color = (
-            random.randint(SEAM_COLOR_RANGE[1][0], SEAM_COLOR_RANGE[0][0]),
-            random.randint(SEAM_COLOR_RANGE[1][1], SEAM_COLOR_RANGE[0][1]),
-            random.randint(SEAM_COLOR_RANGE[1][2], SEAM_COLOR_RANGE[0][2]),
-        )
-        line_width = random.randint(SEAM_WIDTH_MIN, SEAM_WIDTH_MAX)
-        if random.random() > 0.5:
-            y = random.randint(0, height)
-            draw.line([(0, y), (width, y)], fill=color, width=line_width)
-        else:
-            x = random.randint(0, width)
-            draw.line([(x, 0), (x, height)], fill=color, width=line_width)
-    return img
+    """瓦片缝隙模拟已禁用 — 真实截图不会有瓦片边界。"""
+    return image
 
 
 def generate_test_samples(base_map: Image.Image, target_class: int, count: int) -> list:
@@ -220,8 +215,7 @@ def generate_test_samples(base_map: Image.Image, target_class: int, count: int) 
         rotated = rotate_image(base_map, angle)
         crop_size = random.randint(CROP_SIZE_MIN, min(CROP_SIZE_MAX, base_map.size[0], base_map.size[1]))
         cropped = random_crop(rotated, crop_size)
-        with_seams = add_tile_seams(cropped)
-        final = with_seams.resize((FINAL_SAVE_SIZE, FINAL_SAVE_SIZE), Image.Resampling.BILINEAR)
+        final = cropped.resize((FINAL_SAVE_SIZE, FINAL_SAVE_SIZE), Image.Resampling.BILINEAR)
         samples.append(final)
     return samples
 
@@ -260,9 +254,9 @@ def generate_real_test_dataset():
     for city_idx, (lat, lon) in enumerate(test_cities):
         print(f"\n=== City {city_idx+1}/{len(test_cities)}: ({lat:.4f}, {lon:.4f}) ===")
         zoom = random.choice([16, 17, 18])
-        source_idx = city_idx % len(TILE_SOURCES)
+        source_idx = random.choice([0, 0, 0, 1, 1, 2])  # 优先 Esri/Bing
 
-        base_map = download_map_region(lat, lon, zoom, tiles_x=5, tiles_y=5, source_idx=source_idx)
+        base_map = download_map_region(lat, lon, zoom, tiles_x=3, tiles_y=3, source_idx=source_idx)
         if base_map is None:
             print(f"Skipping city {city_idx}")
             continue
@@ -299,7 +293,7 @@ def generate_real_test_dataset():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Oasis-Map-Orientation-Surveyor Real Test Data Generator")
+    print("Oasis-Map-Orientation-Surveyor Real Test Data Generator (v3)")
     print("=" * 60)
     random.seed(123)  # 不同于训练的种子
     np.random.seed(123)
