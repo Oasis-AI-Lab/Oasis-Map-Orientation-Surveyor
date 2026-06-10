@@ -83,31 +83,13 @@ def set_requires_grad_by_block(model, min_block: int):
         param.requires_grad = True
 
 
-def create_mixed_dataloader(real_data_root: str, image_size: int, batch_size: int):
-    """创建合成+真实混合数据集，真实样本权重更高"""
-    # 真实数据
+def create_real_dataloader(real_data_root: str, image_size: int, batch_size: int):
+    """仅使用真实数据创建 DataLoader（纯真实数据微调，避免合成数据稀释）"""
     real_train = RealDataDataset(real_data_root, split="train", image_size=image_size)
     real_val = RealDataDataset(real_data_root, split="val", image_size=image_size)
 
-    # 合成数据
-    synthetic_train = RelativeRotationDataset(str(DATASET_ROOT), split="train", image_size=image_size)
-
-    # 混合训练集
-    mixed_train = ConcatDataset([synthetic_train, real_train])
-
-    # 计算采样权重
-    weights = []
-    for _ in range(len(synthetic_train)):
-        weights.append(MIXED_TRAINING["synthetic_weight"])
-    for _ in range(len(real_train)):
-        weights.append(MIXED_TRAINING["real_weight"])
-
-    sampler = torch.utils.data.WeightedRandomSampler(
-        weights, num_samples=len(weights), replacement=True
-    )
-
     train_loader = DataLoader(
-        mixed_train, batch_size=batch_size, sampler=sampler, num_workers=0
+        real_train, batch_size=batch_size, shuffle=True, num_workers=0
     )
     val_loader = DataLoader(
         real_val, batch_size=batch_size, shuffle=False, num_workers=0
@@ -147,15 +129,15 @@ def finetune(
     model.load_state_dict(state_dict)
     print(f"Loaded pretrained model: {pretrained_path}")
 
-    # 创建混合数据集
-    train_loader, val_loader, real_train, real_val = create_mixed_dataloader(
+    # 创建真实数据 DataLoader
+    train_loader, val_loader, real_train, real_val = create_real_dataloader(
         real_data_root, image_size, batch_size
     )
 
     print(f"Real train samples: {len(real_train)}")
     print(f"Real val samples: {len(real_val)}")
     print(f"Real class distribution: {real_train.get_class_counts()}")
-    print(f"Mixed training batches: {len(train_loader)}")
+    print(f"Training batches: {len(train_loader)}")
 
     if len(real_train) == 0:
         raise ValueError("No real training data found!")

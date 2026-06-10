@@ -3,7 +3,7 @@ real_data_collector.py
 收集真实地图截图并自动标注旋转方向。
 策略：下载大图后，用已知的旋转角度生成带标注的真实样本。
 
-输出目录: dataset_real_labeled/{train,val}/{class_idx}/
+输出目录: C:/Users/Administrator/dataset_real_labeled/{train,val}/{class_idx}/
 """
 
 import os
@@ -29,14 +29,11 @@ from oblique_generator import (
 )
 
 # 配置
-# 输出目录：优先项目目录，无权限时回退到C盘
-_PROJECT_DIR = Path("e:/github projects/OasisCompany/Oasis-Map-Orientation-Surveyor/dataset_real_labeled")
-_C_DIR = Path("C:/Users/Administrator/dataset_real_labeled")
-OUTPUT_DIR = _C_DIR  # 使用C盘避免权限问题
+OUTPUT_DIR = Path("C:/Users/Administrator/dataset_real_labeled")
 TRAIN_RATIO = 0.8
-IMAGES_PER_CLASS = 50  # 每类50张，共400张真实样本
+IMAGES_PER_CLASS = 100  # 每类100张，共800张训练 + 200张验证 = 1000张
 
-# 使用与训练和测试都不同的城市
+# 使用与训练和测试都不同的城市（20个）
 REAL_CITIES = [
     (41.8781, -87.6298),   # Chicago
     (25.7617, -80.1918),   # Miami
@@ -46,6 +43,18 @@ REAL_CITIES = [
     (-23.5505, -46.6333),  # Sao Paulo
     (52.5200, 13.4050),    # Berlin
     (40.4168, -3.7038),    # Madrid
+    (39.7392, -104.9903),  # Denver
+    (33.4484, -112.0740),  # Phoenix
+    (47.6062, -122.3321),  # Seattle
+    (29.7604, -95.3698),   # Houston
+    (35.2271, -80.8431),   # Charlotte
+    (45.5152, -122.6784),  # Portland
+    (38.9072, -77.0369),   # Washington DC
+    (33.7490, -84.3880),   # Atlanta
+    (32.7157, -117.1611),  # San Diego
+    (42.3601, -71.0589),   # Boston
+    (36.1627, -86.7816),   # Nashville
+    (39.9526, -75.1652),   # Philadelphia
 ]
 
 
@@ -64,7 +73,9 @@ def collect_real_labeled_data():
 
     for city_idx, (lat, lon) in enumerate(REAL_CITIES):
         print(f"Downloading city {city_idx+1}/{len(REAL_CITIES)}: ({lat:.4f}, {lon:.4f})")
-        base_map = download_map_region(lat, lon, zoom=17, tiles_x=3, tiles_y=3)
+        # 随机 zoom 级别 15-18
+        zoom = random.choice([15, 16, 17, 18])
+        base_map = download_map_region(lat, lon, zoom=zoom, tiles_x=3, tiles_y=3)
         if base_map is None:
             continue
 
@@ -75,6 +86,9 @@ def collect_real_labeled_data():
 
             # 随机裁剪多个样本
             samples_per_city = IMAGES_PER_CLASS // len(REAL_CITIES)
+            if samples_per_city < 1:
+                samples_per_city = 1
+
             for i in range(samples_per_city):
                 crop_size = random.randint(512, min(1024, rotated.size[0], rotated.size[1]))
                 x = random.randint(0, max(0, rotated.size[0] - crop_size))
@@ -120,7 +134,8 @@ def print_summary():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Oasis-Map-Orientation-Surveyor Real Data Collector")
+    print("Oasis-Map-Orientation-Surveyor Real Data Collector v2")
+    print(f"Target: {IMAGES_PER_CLASS * 8} samples ({IMAGES_PER_CLASS} per class)")
     print("=" * 60)
     random.seed(456)
     np.random.seed(456)

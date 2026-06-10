@@ -66,17 +66,27 @@ def mixup_data(x, y, alpha=0.2):
     return mixed_x, y_a, y_b, lam
 
 
-def circular_smooth_label(labels, num_classes=8, sigma=1.0):
-    """生成环形平滑软标签，编码角度连续性"""
+
+
+
+def csl_loss(outputs, labels, num_classes=8, sigma=1.0):
+    """
+    Circular Smooth Label loss.
+    将硬标签转换为环形平滑软标签，使用 CrossEntropyLoss 计算。
+    相比 KLDivLoss，不需要 log_softmax，实现更简单稳定。
+    """
     batch_size = labels.size(0)
     smooth_labels = torch.zeros(batch_size, num_classes, device=labels.device)
     for i in range(batch_size):
         for j in range(num_classes):
             angle_diff = abs(j - labels[i].item())
-            angle_diff = min(angle_diff, num_classes - angle_diff)  # 环形距离
+            angle_diff = min(angle_diff, num_classes - angle_diff)
             smooth_labels[i, j] = math.exp(-angle_diff ** 2 / (2 * sigma ** 2))
         smooth_labels[i] /= smooth_labels[i].sum()
-    return smooth_labels
+    # 使用 -sum(p * log_softmax(q)) 形式，等价于 KLDivLoss 但更安全
+    log_probs = torch.nn.functional.log_softmax(outputs, dim=1)
+    loss = -(smooth_labels * log_probs).sum(dim=1).mean()
+    return loss
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device,
@@ -96,9 +106,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device,
             optimizer.zero_grad()
             outputs = model(images)
             if use_csl:
-                soft_a = circular_smooth_label(labels_a, NUM_CLASSES, csl_sigma)
-                soft_b = circular_smooth_label(labels_b, NUM_CLASSES, csl_sigma)
-                loss = lam * criterion(outputs, soft_a) + (1 - lam) * criterion(outputs, soft_b)
+                loss_a = csl_loss(outputs, labels_a, NUM_CLASSES, csl_sigma)
+                loss_b = csl_loss(outputs, labels_b, NUM_CLASSES, csl_sigma)
+                loss = lam * loss_a + (1 - lam) * loss_b
             else:
                 loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
             # Mixup 准确率：取两个标签中概率更高的
@@ -109,8 +119,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device,
             optimizer.zero_grad()
             outputs = model(images)
             if use_csl:
-                soft_labels = circular_smooth_label(labels, NUM_CLASSES, csl_sigma)
-                loss = criterion(outputs, soft_labels)
+                loss = csl_loss(outputs, labels, NUM_CLASSES, csl_sigma)
             else:
                 loss = criterion(outputs, labels)
             _, predicted = outputs.max(1)
@@ -188,10 +197,10 @@ def main():
     model = build_model(num_classes=NUM_CLASSES, pretrained=True, backbone=BACKBONE).to(DEVICE)
     print(f"Model: {BACKBONE}, Parameters: {count_parameters(model):,}")
 
-    # 损失函数：CSL 使用 KLDivLoss，否则使用 CrossEntropyLoss
+    # 损失函数：CSL 使用自定义 csl_loss，否则使用 CrossEntropyLoss
     if USE_CSL:
-        criterion = nn.KLDivLoss(reduction='batchmean')
-        print(f"Loss: KLDivLoss (CSL, sigma={CSL_SIGMA})")
+        criterion = None  # CSL 使用 csl_loss 函数，不需要 criterion
+        print(f"Loss: CSL (Circular Smooth Label, sigma={CSL_SIGMA})")
     else:
         criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
         print(f"Loss: CrossEntropyLoss (label_smoothing={LABEL_SMOOTHING})")
