@@ -138,8 +138,12 @@ TRAIN_AUGMENTATION = {
 MIXUP_ALPHA = 0.2
 
 # CSL (Circular Smooth Label) 配置
+# sigma 控制平滑程度：
+# - sigma=1.0: 相邻类别权重 0.61, 180° 权重 0.14 (默认)
+# - sigma=0.8: 相邻类别权重 0.46, 180° 权重 0.04 (更严格，减少弱类混淆)
+# - sigma=1.2: 相邻类别权重 0.73, 180° 权重 0.24 (更宽松)
 USE_CSL = True
-CSL_SIGMA = 1.0
+CSL_SIGMA = 0.8  # 针对 135°/225°/315° 弱类，降低相邻类别权重以减少混淆
 
 # ImageNet 标准归一化
 IMAGENET_MEAN = [0.485, 0.456, 0.406]

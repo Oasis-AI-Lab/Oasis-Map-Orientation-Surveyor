@@ -29,7 +29,8 @@ from tqdm import tqdm
 
 # ==================== 配置参数 ====================
 
-# 纯卫星图源（Esri 最稳定放前面，Google 在中国可能超时）
+# 卫星图源（Esri 最稳定放前面，Google 在中国可能超时）
+# 新增中国地图源：高德卫星、百度卫星
 TILE_SOURCES = [
     {
         "name": "Esri World Imagery",
@@ -51,6 +52,24 @@ TILE_SOURCES = [
     {
         "name": "Google Satellite (mt3)",
         "url": "https://mt3.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+    },
+    # 中国地图源 - 高德卫星图
+    {
+        "name": "Amap Satellite",
+        "url": "https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
+    },
+    {
+        "name": "Amap Satellite (02)",
+        "url": "https://webst02.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
+    },
+    {
+        "name": "Amap Satellite (03)",
+        "url": "https://webst03.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
+    },
+    # 中国地图源 - 百度卫星图（需坐标转换，使用简化版）
+    {
+        "name": "Baidu Satellite",
+        "url": "https://maponline0.bdimg.com/tile/?qt=vtile&x={x}&y={y}&z={z}&styles=pl&scaler=1&udt=20240101",
     },
 ]
 

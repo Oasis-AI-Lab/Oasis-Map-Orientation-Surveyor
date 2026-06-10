@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Oasis Map Orientation Surveyor - Demo</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+            padding: 20px;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 10px; font-size: 28px; }
+        .subtitle { text-align: center; color: #8892b0; margin-bottom: 30px; }
+        .upload-zone {
+            border: 2px dashed #64ffda;
+            border-radius: 16px;
+            padding: 60px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: rgba(100, 255, 218, 0.05);
+        }
+        .upload-zone:hover {
+            background: rgba(100, 255, 218, 0.1);
+            transform: translateY(-2px);
+        }
+        .upload-zone.dragover {
+            background: rgba(100, 255, 218, 0.2);
+            border-color: #fff;
+        }
+        .upload-icon { font-size: 48px; margin-bottom: 16px; }
+        .upload-text { font-size: 18px; color: #ccd6f6; }
+        .upload-hint { font-size: 14px; color: #8892b0; margin-top: 8px; }
+        #fileInput { display: none; }
+        .preview-section { display: none; margin-top: 30px; }
+        .preview-section.active { display: block; }
+        .preview-image {
+            width: 100%;
+            max-width: 400px;
+            border-radius: 12px;
+            margin: 0 auto 20px;
+            display: block;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        .result-card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 16px;
+            padding: 24px;
+            backdrop-filter: blur(10px);
+        }
+        .result-main {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .result-angle {
+            font-size: 64px;
+            font-weight: bold;
+            color: #64ffda;
+        }
+        .result-info { text-align: left; }
+        .result-class { font-size: 24px; color: #ccd6f6; }
+        .result-confidence { font-size: 18px; color: #8892b0; }
+        .probabilities {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+        }
+        .prob-item {
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+        }
+        .prob-item.active { background: rgba(100, 255, 218, 0.15); border: 1px solid #64ffda; }
+        .prob-angle { font-size: 14px; color: #8892b0; }
+        .prob-value { font-size: 20px; font-weight: bold; color: #ccd6f6; }
+        .prob-bar {
+            height: 4px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 2px;
+            margin-top: 8px;
+            overflow: hidden;
+        }
+        .prob-bar-fill {
+            height: 100%;
+            background: #64ffda;
+            border-radius: 2px;
+            transition: width 0.5s ease;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+        }
+        .loading.active { display: block; }
+        .spinner {
+            width: 40px; height: 40px;
+            border: 3px solid rgba(100, 255, 218, 0.3);
+            border-top-color: #64ffda;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .error {
+            display: none;
+            background: rgba(255, 100, 100, 0.1);
+            border: 1px solid rgba(255, 100, 100, 0.3);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            color: #ff6464;
+        }
+        .error.active { display: block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🧭 Oasis Map Orientation Surveyor</h1>
+        <p class="subtitle">上传地图截图，检测相对旋转方向</p>
+        
+        <div class="upload-zone" id="uploadZone">
+            <div class="upload-icon">📤</div>
+            <div class="upload-text">点击或拖拽上传地图截图</div>
+            <div class="upload-hint">支持 PNG、JPG 格式</div>
+        </div>
+        <input type="file" id="fileInput" accept="image/*">
+        
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>正在分析旋转方向...</p>
+        </div>
+        
+        <div class="error" id="error"></div>
+        
+        <div class="preview-section" id="previewSection">
+            <img class="preview-image" id="previewImage" alt="Preview">
+            <div class="result-card">
+                <div class="result-main">
+                    <div class="result-angle" id="resultAngle">0°</div>
+                    <div class="result-info">
+                        <div class="result-class" id="resultClass">Class 0</div>
+                        <div class="result-confidence" id="resultConfidence">Confidence: 0%</div>
+                    </div>
+                </div>
+                <div class="probabilities" id="probabilities"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const loading = document.getElementById('loading');
+        const error = document.getElementById('error');
+        const previewSection = document.getElementById('previewSection');
+        const previewImage = document.getElementById('previewImage');
+
+        uploadZone.addEventListener('click', () => fileInput.click());
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+        uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) handleFile(file);
+        });
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) handleFile(file);
+        });
+
+        async function handleFile(file) {
+            if (!file.type.startsWith('image/')) {
+                showError('请上传图片文件');
+                return;
+            }
+
+            // 显示预览
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                previewImage.src = e.target.result;
+                previewSection.classList.add('active');
+            };
+            reader.readAsDataURL(file);
+
+            // 显示加载
+            loading.classList.add('active');
+            error.classList.remove('active');
+
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const response = await fetch('http://localhost:8000/predict', {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+                }
+
+                const result = await response.json();
+                displayResult(result);
+            } catch (err) {
+                showError('推理失败: ' + err.message + '\n请确保 API 服务已启动 (python api_server.py)');
+            } finally {
+                loading.classList.remove('active');
+            }
+        }
+
+        function displayResult(result) {
+            document.getElementById('resultAngle').textContent = result.angle + '°';
+            document.getElementById('resultClass').textContent = 'Class ' + result.class_idx;
+            document.getElementById('resultConfidence').textContent = 
+                'Confidence: ' + (result.confidence * 100).toFixed(1) + '%';
+
+            const probsContainer = document.getElementById('probabilities');
+            probsContainer.innerHTML = '';
+
+            const angles = ['0°', '45°', '90°', '135°', '180°', '225°', '270°', '315°'];
+            angles.forEach((angle, i) => {
+                const prob = result.probabilities[angle] || 0;
+                const item = document.createElement('div');
+                item.className = 'prob-item' + (i === result.class_idx ? ' active' : '');
+                item.innerHTML = `
+                    <div class="prob-angle">${angle}</div>
+                    <div class="prob-value">${(prob * 100).toFixed(1)}%</div>
+                    <div class="prob-bar"><div class="prob-bar-fill" style="width: ${prob * 100}%"></div></div>
+                `;
+                probsContainer.appendChild(item);
+            });
+        }
+
+        function showError(msg) {
+            error.textContent = msg;
+            error.classList.add('active');
+            loading.classList.remove('active');
+        }
+    </script>
+</body>
+</html>
