@@ -4,6 +4,8 @@ from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 
+from config import IMAGENET_MEAN, IMAGENET_STD, TRAIN_AUGMENTATION
+
 
 class RelativeRotationDataset(Dataset):
     """
@@ -27,24 +29,32 @@ class RelativeRotationDataset(Dataset):
         self.samples.sort(key=lambda x: (x[1], x[0]))
 
         if split == "train":
+            aug = TRAIN_AUGMENTATION
             self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15),
+                transforms.Resize((image_size + aug["random_crop_pad"], image_size + aug["random_crop_pad"])),
+                transforms.RandomCrop(image_size),
+                transforms.ColorJitter(**aug["color_jitter"]),
+                transforms.RandomRotation(degrees=aug["random_rotation"]),
+                transforms.RandomAffine(
+                    degrees=0,
+                    translate=aug["random_affine_translate"],
+                    shear=aug["random_affine_shear"]
+                ),
                 transforms.RandomApply([
-                    transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
-                ], p=0.5),
+                    transforms.GaussianBlur(**{k: v for k, v in aug["gaussian_blur"].items() if k != "p"})
+                ], p=aug["gaussian_blur"]["p"]),
                 transforms.RandomApply([
-                    transforms.RandomAdjustSharpness(sharpness_factor=2)
-                ], p=0.3),
-                transforms.RandomGrayscale(p=0.05),
+                    transforms.RandomAdjustSharpness(sharpness_factor=aug["sharpness"]["factor"])
+                ], p=aug["sharpness"]["p"]),
+                transforms.RandomGrayscale(p=aug["grayscale"]["p"]),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ])
         else:
             self.transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ])
 
     def __len__(self):

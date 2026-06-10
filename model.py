@@ -5,11 +5,14 @@ from torchvision.models import (
     efficientnet_b0, EfficientNet_B0_Weights,
 )
 
+from config import DROPOUT_P
+
 
 class RelativeRotationModel(nn.Module):
     """
     相对旋转方向分类模型。
     支持 EfficientNet-B0（默认）和 MobileNetV3-Small 两种 backbone。
+    分类头前添加 Dropout 防止过拟合。
     """
 
     def __init__(self, num_classes: int = 8, pretrained: bool = False, backbone: str = "efficientnet_b0"):
@@ -19,12 +22,18 @@ class RelativeRotationModel(nn.Module):
             weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
             self.backbone = efficientnet_b0(weights=weights)
             in_features = self.backbone.classifier[-1].in_features
-            self.backbone.classifier[-1] = nn.Linear(in_features, num_classes)
+            self.backbone.classifier = nn.Sequential(
+                nn.Dropout(p=DROPOUT_P),
+                nn.Linear(in_features, num_classes)
+            )
         elif backbone == "mobilenet_v3_small":
             weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
             self.backbone = mobilenet_v3_small(weights=weights)
             in_features = self.backbone.classifier[-1].in_features
-            self.backbone.classifier[-1] = nn.Linear(in_features, num_classes)
+            self.backbone.classifier = nn.Sequential(
+                nn.Dropout(p=DROPOUT_P),
+                nn.Linear(in_features, num_classes)
+            )
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
 

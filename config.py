@@ -1,6 +1,6 @@
 """
 Oasis Map Orientation Surveyor - 统一配置管理
-所有路径和超参数集中在此，消除硬编码
+所有路径和超参数集中在此，消除硬编码。
 """
 
 from pathlib import Path
@@ -27,18 +27,24 @@ REAL_DATA_VAL = REAL_DATA_LABELED / "val"
 # =============================================================================
 # 模型输出路径
 # =============================================================================
-# 输出目录：优先使用项目目录，无权限时回退到C盘
+# 输出目录：优先使用项目目录，检测写权限后回退到C盘
 _PROJECT_OUTPUT = PROJECT_ROOT / "outputs"
 _C_USER_OUTPUT = Path(r"C:\Users\Administrator\model_output")
-if _PROJECT_OUTPUT.exists() or True:  # 尝试项目目录
+
+try:
+    _PROJECT_OUTPUT.mkdir(parents=True, exist_ok=True)
+    _test_file = _PROJECT_OUTPUT / ".permission_test"
+    _test_file.write_text("test")
+    _test_file.unlink()
     OUTPUT_DIR = _PROJECT_OUTPUT
-else:
+except (PermissionError, OSError):
     OUTPUT_DIR = _C_USER_OUTPUT
+
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 优先使用 outputs/ 下的模型，回退到根目录（兼容旧版本）
-BEST_MODEL_PATH = OUTPUT_DIR / "best_model.pth" if (OUTPUT_DIR / "best_model.pth").exists() else PROJECT_ROOT / "best_model.pth"
-FINETUNED_MODEL_PATH = OUTPUT_DIR / "finetuned_model.pth" if (OUTPUT_DIR / "finetuned_model.pth").exists() else PROJECT_ROOT / "finetuned_model.pth"
+# 模型文件路径（统一由 OUTPUT_DIR 派生，无回退逻辑）
+BEST_MODEL_PATH = OUTPUT_DIR / "best_model.pth"
+FINETUNED_MODEL_PATH = OUTPUT_DIR / "finetuned_model.pth"
 ONNX_PATH = OUTPUT_DIR / "rotation_model.onnx"
 CONFUSION_MATRIX_PATH = OUTPUT_DIR / "confusion_matrix.png"
 
@@ -67,6 +73,7 @@ NUM_CLASSES = 8                 # 8个方向区间 (0°, 45°, ..., 315°)
 ANGLE_PER_CLASS = 360 // NUM_CLASSES  # 45°
 IMAGE_SIZE = 256                # 模型输入尺寸
 BACKBONE = "efficientnet_b0"    # 默认backbone
+DROPOUT_P = 0.3                 # 分类头前 Dropout 概率
 
 # =============================================================================
 # 训练超参数
@@ -84,6 +91,10 @@ TRAIN_CONFIG = {
     "early_stop_min_delta": 0.001,
 }
 
+# 从 TRAIN_CONFIG 中提取常用值，方便直接导入
+WARMUP_EPOCHS = TRAIN_CONFIG["warmup_epochs"]
+FREEZE_EPOCHS = TRAIN_CONFIG["freeze_epochs"]
+
 # 微调超参数
 FINETUNE_CONFIG = {
     "batch_size": 16,
@@ -94,6 +105,21 @@ FINETUNE_CONFIG = {
     "early_stop_patience": 10,
 }
 
+# 渐进式解冻阶段配置
+PROGRESSIVE_UNFREEZE = {
+    "phase1_end": 5,       # Phase 1: 仅 classifier (Epoch 1-5)
+    "phase2_end": 15,      # Phase 2: + block 6-7 (Epoch 6-15)
+    # Phase 3: + block 5 (Epoch 16+)
+    "phase2_lr": 5e-5,     # Phase 2 学习率
+    "phase3_lr": 1e-5,     # Phase 3 学习率
+}
+
+# 混合训练配置
+MIXED_TRAINING = {
+    "synthetic_weight": 0.3,   # 合成数据采样权重
+    "real_weight": 1.0,        # 真实数据采样权重
+}
+
 # =============================================================================
 # 数据增强配置
 # =============================================================================
@@ -102,7 +128,18 @@ TRAIN_AUGMENTATION = {
     "gaussian_blur": {"kernel_size": 5, "sigma": (0.1, 2.0), "p": 0.5},
     "sharpness": {"factor": 2, "p": 0.3},
     "grayscale": {"p": 0.05},
+    "random_rotation": 10,       # ±10°
+    "random_affine_translate": (0.05, 0.05),
+    "random_affine_shear": 2,
+    "random_crop_pad": 32,       # Resize to IMAGE_SIZE+32 后裁剪
 }
+
+# Mixup 配置
+MIXUP_ALPHA = 0.2
+
+# CSL (Circular Smooth Label) 配置
+USE_CSL = True
+CSL_SIGMA = 1.0
 
 # ImageNet 标准归一化
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -142,8 +179,12 @@ def print_config():
     print(f"Project Root: {PROJECT_ROOT}")
     print(f"Dataset Root: {DATASET_ROOT}")
     print(f"Output Dir:   {OUTPUT_DIR}")
+    print(f"Best Model:   {BEST_MODEL_PATH}")
     print(f"Image Size:   {IMAGE_SIZE}")
     print(f"Backbone:     {BACKBONE}")
+    print(f"Dropout:      {DROPOUT_P}")
+    print(f"Mixup Alpha:  {MIXUP_ALPHA}")
+    print(f"CSL:          {USE_CSL} (sigma={CSL_SIGMA})")
     print(f"Classes:      {CLASS_NAMES}")
     print("=" * 60)
 

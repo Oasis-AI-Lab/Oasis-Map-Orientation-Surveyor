@@ -15,6 +15,7 @@ venv/
 dataset/
 dataset_raw/
 dataset_real_labeled/
+dataset_real_test/
 
 # Training outputs
 outputs/
@@ -33,3 +34,4 @@ Thumbs.db
 
 # Misc
 check_dataset.py
+eval/

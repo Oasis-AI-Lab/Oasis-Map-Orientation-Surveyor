@@ -9,6 +9,8 @@ import onnxruntime as ort
 from PIL import Image
 from typing import Dict, List, Optional
 
+from config import IMAGE_SIZE, CLASS_NAMES, IMAGENET_MEAN, IMAGENET_STD
+
 
 class RotationPredictor:
     """
@@ -16,23 +18,23 @@ class RotationPredictor:
     使用 ONNX Runtime 进行推理，输入 PIL Image，返回预测结果字典。
     """
 
-    def __init__(self, model_path: str, image_size: int = 224, providers: Optional[List[str]] = None):
+    def __init__(self, model_path: str, image_size: int = IMAGE_SIZE, providers: Optional[List[str]] = None):
         """
         Args:
             model_path: ONNX 模型文件路径
-            image_size: 模型输入尺寸（正方形）
-            providers: ONNX Runtime 执行提供者，默认 ["CPUExecutionProvider"]
+            image_size: 模型输入尺寸（正方形），默认从 config.py 导入
+            providers: ONNX Runtime 执行提供者，默认自动选择 (CUDA > CPU)
         """
         if providers is None:
-            providers = ["CPUExecutionProvider"]
+            providers = ort.get_available_providers()
 
         self.session = ort.InferenceSession(model_path, providers=providers)
         self.image_size = image_size
-        self.classes = [f"{i * 45}°" for i in range(8)]
+        self.classes = CLASS_NAMES
 
-        # ImageNet 标准归一化参数
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        # ImageNet 标准归一化参数（从 config.py 导入）
+        self.mean = np.array(IMAGENET_MEAN, dtype=np.float32).reshape(1, 1, 3)
+        self.std = np.array(IMAGENET_STD, dtype=np.float32).reshape(1, 1, 3)
 
     def preprocess(self, image: Image.Image) -> np.ndarray:
         """
@@ -136,7 +138,8 @@ if __name__ == "__main__":
     import sys
     from pathlib import Path
 
-    model_path = "rotation_model.onnx"
+    from config import ONNX_PATH
+    model_path = str(ONNX_PATH)
     if not Path(model_path).exists():
         print(f"Model not found: {model_path}")
         print("Please run export.py first.")

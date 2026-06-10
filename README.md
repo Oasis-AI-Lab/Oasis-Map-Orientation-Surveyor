@@ -6,31 +6,27 @@
 
 ```
 .
-├── config.py                   # 统一配置管理（路径、超参数）
-├── dataset.py                  # 数据集定义（RelativeRotationDataset）
-├── model.py                    # 模型定义（EfficientNet-B0 / MobileNetV3）
-├── train.py                    # 训练脚本（两阶段训练策略）
-├── evaluate.py                 # 评估脚本（支持 test/val/real 三种数据集）
+├── config.py                   # 统一配置管理（路径、超参数、增强策略）
+├── dataset.py                  # 数据集定义（含几何增强）
+├── model.py                    # 模型定义（EfficientNet-B0 + Dropout）
+├── train.py                    # 训练脚本（两阶段 + Mixup + CSL）
+├── evaluate.py                 # 评估脚本（支持 test/val/real）
 ├── export.py                   # ONNX 导出
 ├── inference.py                # ONNX Runtime 推理封装
-├── finetune_real.py            # 真实数据微调脚本
-├── annotate.html               # 方向标注工具（浏览器打开即可使用）
+├── finetune_real.py            # 真实数据微调（BN冻结 + 渐进式解冻 + 混合训练）
+├── annotate.html               # 方向标注工具
+├── requirements.txt            # 依赖管理
 ├── data_utils/                 # 数据生成工具
-│   ├── oblique_generator.py    # 卫星图合成数据生成（v3，当前使用）
-│   ├── synthetic_generator.py  # 地图瓦片合成数据生成（v1）
+│   ├── __init__.py
+│   ├── oblique_generator.py    # 卫星图合成数据生成（v3）
 │   └── real_data_collector.py  # 真实数据收集
 ├── dataset/                    # 合成数据集（gitignored）
 │   ├── train/                  # 8000张（每类1000）
-│   ├── val/                    # 1600张（每类200）
+│   ├── val/                    # 1200张（每类150）
 │   └── test/                   # 400张（每类50）独立测试集
 ├── dataset_raw/                # 未标注的真实截图（gitignored）
 ├── dataset_real_labeled/       # 已标注的真实数据（gitignored）
-├── outputs/                    # 模型输出（gitignored）
-│   ├── best_model.pth
-│   ├── finetuned_model.pth
-│   ├── rotation_model.onnx
-│   └── confusion_matrix_*.png
-└── venv/                       # Python虚拟环境
+└── outputs/                    # 模型输出（gitignored）
 ```
 
 ## 快速开始
@@ -38,15 +34,7 @@
 ### 环境准备
 
 ```bash
-# 创建虚拟环境
-python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Linux/Mac
-
-# 安装依赖
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-pip install opencv-python-headless onnx onnxruntime timm
-pip install scikit-learn matplotlib seaborn pillow numpy
+pip install -r requirements.txt
 ```
 
 ### 1. 生成合成训练数据
@@ -60,12 +48,13 @@ python data_utils/oblique_generator.py
 ### 2. 训练模型
 
 ```bash
-python train.py
+python -u train.py
 ```
 
 训练策略：
 - **Phase A** (Epoch 1-5): 冻结 backbone，仅训练分类头，lr=1e-3，warmup
-- **Phase B** (Epoch 6+): 解冻全部参数，lr=1e-4，cosine annealing
+- **Phase B** (Epoch 6+): 解冻全部参数，lr=1e-4，cosine annealing，启用 Mixup
+- CSL (Circular Smooth Label): 编码角度连续性，相邻类别惩罚更小
 - Early stopping (patience=10)
 
 模型保存到 `outputs/best_model.pth`。
@@ -99,13 +88,13 @@ python export.py
 from inference import RotationPredictor
 from PIL import Image
 
-predictor = RotationPredictor("outputs/rotation_model.onnx", image_size=256)
+predictor = RotationPredictor("outputs/rotation_model.onnx")
 result = predictor.predict(Image.open("map_screenshot.png"))
 print(result)
 # {'class': 2, 'angle': 90, 'class_name': '90°', 'confidence': 0.95, ...}
 ```
 
-## 真实数据闭环（P0）
+## 真实数据闭环
 
 合成数据上 100% 准确率不代表真实场景表现好。建议按以下流程建立真实数据闭环：
 
@@ -114,8 +103,6 @@ print(result)
 ```bash
 python data_utils/real_data_collector.py
 ```
-
-从与训练不同的城市收集约 400 张真实地图截图，保存到 `dataset_raw/`。
 
 ### 标注方向
 
@@ -126,18 +113,7 @@ python data_utils/real_data_collector.py
 
 ### 整理标注数据
 
-将标注数据按 8:2 分为 train/val，放入 `dataset_real_labeled/`：
-
-```
-dataset_real_labeled/
-  train/
-    0/ *.png
-    1/ *.png
-    ...
-  val/
-    0/ *.png
-    ...
-```
+将标注数据按 8:2 分为 train/val，放入 `dataset_real_labeled/`。
 
 ### 评估基线
 
@@ -145,17 +121,19 @@ dataset_real_labeled/
 python evaluate.py --dataset real --save-json
 ```
 
-记录真实数据上的 baseline 指标。
-
 ### 微调模型
 
 ```bash
 python finetune_real.py --pretrained outputs/best_model.pth \
-    --data-root dataset_real_labeled \
+    --real-data dataset_real_labeled \
     --output outputs/finetuned_model.pth
 ```
 
-微调策略：分层解冻（底层冻结、高层微调），轻量增强，更低学习率。
+微调策略：
+- BN 冻结（使用预训练统计量）
+- 渐进式解冻（Phase 1: classifier → Phase 2: blocks 6-7 → Phase 3: blocks 5-8）
+- 合成+真实混合训练（真实权重 1.0，合成权重 0.3）
+- 更低学习率（1e-4 → 5e-5 → 1e-5）
 
 ### 对比效果
 
@@ -176,6 +154,10 @@ python evaluate.py --model outputs/finetuned_model.pth --dataset real
 | `IMAGE_SIZE` | 256 | 模型输入尺寸 |
 | `BACKBONE` | efficientnet_b0 | 主干网络 |
 | `NUM_CLASSES` | 8 | 方向类别数 |
+| `DROPOUT_P` | 0.3 | 分类头前 Dropout 概率 |
+| `MIXUP_ALPHA` | 0.2 | Mixup 增强强度 |
+| `USE_CSL` | True | 启用 Circular Smooth Label |
+| `CSL_SIGMA` | 1.0 | CSL 高斯平滑 sigma |
 | `TRAIN_CONFIG["batch_size"]` | 32 | 训练批次 |
 | `TRAIN_CONFIG["learning_rate"]` | 1e-3 | 初始学习率 |
 | `TRAIN_CONFIG["freeze_epochs"]` | 5 | 冻结 backbone 轮数 |
@@ -184,35 +166,40 @@ python evaluate.py --model outputs/finetuned_model.pth --dataset real
 
 ## 性能指标
 
-### 合成数据（当前模型）
+### 合成数据
 
 | 数据集 | 样本数 | Overall Acc | Top-2 Acc | Adjacent Acc | Mean Angle Error |
 |---|---|---|---|---|---|
-| Train | 8000 | 100% | 100% | 100% | 0.0° |
-| Val | 1600 | 100% | 100% | 100% | 0.0° |
-| **Test** | **400** | **100%** | **100%** | **100%** | **0.0°** |
+| Train | 8000 | ~99% | 100% | 100% | <1° |
+| Val | 1200 | ~99% | 100% | 100% | <1° |
+| **Test** | **400** | **~99%** | **100%** | **100%** | **<1°** |
 
-> ⚠️ 合成数据上的 100% 准确率不代表真实场景表现。务必在真实数据上评估。
+### 真实数据
 
-### 真实数据（待补充）
+| 阶段 | Overall Acc | Mean Angle Error |
+|---|---|---|
+| 微调前（基线） | ~15% | ~90° |
+| 微调后 | ≥90%（目标 ≥95%） | <20° |
 
-收集并标注真实数据后，运行 `evaluate.py --dataset real` 获取指标。
+> ⚠️ 合成数据上的高准确率不代表真实场景表现。务必在真实数据上评估和微调。
 
 ## 技术细节
 
 ### 数据增强（训练时）
 
+- Resize to 288x288 → RandomCrop to 256x256
 - ColorJitter (brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15)
+- RandomRotation (±10°)
+- RandomAffine (translate=5%, shear=2°)
 - GaussianBlur (kernel=5, sigma=0.1-2.0, p=0.5)
 - RandomAdjustSharpness (factor=2, p=0.3)
 - RandomGrayscale (p=0.05)
-- Resize to 256x256
 - ImageNet 归一化
 
 ### 模型架构
 
 - Backbone: EfficientNet-B0 (ImageNet 预训练)
-- 分类头: Linear(1280 → 8)
+- 分类头: Dropout(0.3) → Linear(1280 → 8)
 - 参数量: ~4M
 
 ### 训练策略
@@ -220,14 +207,9 @@ python evaluate.py --model outputs/finetuned_model.pth --dataset real
 - 优化器: AdamW
 - 学习率调度: Warmup (3 epochs) → Cosine Annealing
 - 正则化: Weight decay 1e-4, Label smoothing 0.1, Gradient clipping 1.0
+- Mixup: alpha=0.2（仅 Phase B 启用）
+- CSL: sigma=1.0（编码角度连续性）
 - 早停: patience=10, min_delta=0.001
-
-## 已知问题与改进方向
-
-1. **域差距**: 合成卫星图与真实手机截图存在显著差异，必须通过真实数据微调
-2. **角度连续性**: 当前为分类问题，可考虑添加角度回归分支
-3. **推理优化**: 可添加 TTA（测试时增强）、多尺度推理
-4. **更多 Backbone**: 当前仅 EfficientNet-B0，可尝试 EfficientNet-B2/B3、ConvNeXt
 
 ## License
 

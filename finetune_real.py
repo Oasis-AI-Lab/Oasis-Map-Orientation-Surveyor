@@ -1,6 +1,7 @@
 """
 finetune_real.py
 使用少量真实标注数据对预训练模型进行微调。
+支持：BN 冻结、渐进式解冻、合成+真实混合训练。
 """
 
 import sys
@@ -9,36 +10,31 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torchvision.transforms as transforms
 import numpy as np
-from pathlib import Path
 import argparse
 
+from config import (
+    DATASET_ROOT, IMAGE_SIZE, NUM_CLASSES, BACKBONE,
+    FINETUNE_CONFIG, PROGRESSIVE_UNFREEZE, MIXED_TRAINING,
+    IMAGENET_MEAN, IMAGENET_STD, FINETUNED_MODEL_PATH,
+)
 from dataset import RelativeRotationDataset
 from model import build_model
 
 
 class RealDataDataset(RelativeRotationDataset):
     """
-    继承 RelativeRotationDataset，但使用真实数据路径。
+    真实数据数据集。继承 RelativeRotationDataset，但使用较轻的增强。
     假设真实数据目录结构: dataset_real_labeled/{train,val}/{label}/*.png
     """
+
     def __init__(self, root_dir: str, split: str = "train", image_size: int = 256):
-        self.root_dir = Path(root_dir) / split
-        self.image_size = image_size
-        self.split = split
-
-        self.samples = []
-        for label_dir in self.root_dir.iterdir():
-            if label_dir.is_dir() and label_dir.name.isdigit():
-                label = int(label_dir.name)
-                for img_path in label_dir.glob("*.png"):
-                    self.samples.append((str(img_path), label))
-
-        self.samples.sort(key=lambda x: (x[1], x[0]))
+        # 调用父类初始化，但覆盖 transform
+        super().__init__(root_dir, split=split, image_size=image_size)
 
         # 微调时使用较轻的增强，避免破坏真实特征
         if split == "train":
@@ -46,93 +42,173 @@ class RealDataDataset(RelativeRotationDataset):
                 transforms.Resize((image_size, image_size)),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                ),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ])
         else:
             self.transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                ),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ])
 
     def get_class_counts(self):
-        counts = {}
+        """返回 list（与父类一致）"""
+        counts = [0] * 8
         for _, label in self.samples:
-            counts[label] = counts.get(label, 0) + 1
+            counts[label] += 1
         return counts
+
+
+def freeze_bn(model):
+    """冻结所有 BatchNorm 层，使用预训练统计量"""
+    for module in model.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            module.eval()
+            module.weight.requires_grad = False
+            module.bias.requires_grad = False
+
+
+def set_requires_grad_by_block(model, min_block: int):
+    """
+    按 block 索引设置 requires_grad。
+    EfficientNet-B0 features 命名格式: {block_idx}.{sub_idx}.param_name
+    """
+    for name, param in model.backbone.features.named_parameters():
+        parts = name.split('.')
+        block_idx = int(parts[0]) if parts[0].isdigit() else -1
+        param.requires_grad = (block_idx >= min_block)
+
+    # classifier 始终可训练
+    for param in model.backbone.classifier.parameters():
+        param.requires_grad = True
+
+
+def create_mixed_dataloader(real_data_root: str, image_size: int, batch_size: int):
+    """创建合成+真实混合数据集，真实样本权重更高"""
+    # 真实数据
+    real_train = RealDataDataset(real_data_root, split="train", image_size=image_size)
+    real_val = RealDataDataset(real_data_root, split="val", image_size=image_size)
+
+    # 合成数据
+    synthetic_train = RelativeRotationDataset(str(DATASET_ROOT), split="train", image_size=image_size)
+
+    # 混合训练集
+    mixed_train = ConcatDataset([synthetic_train, real_train])
+
+    # 计算采样权重
+    weights = []
+    for _ in range(len(synthetic_train)):
+        weights.append(MIXED_TRAINING["synthetic_weight"])
+    for _ in range(len(real_train)):
+        weights.append(MIXED_TRAINING["real_weight"])
+
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights, num_samples=len(weights), replacement=True
+    )
+
+    train_loader = DataLoader(
+        mixed_train, batch_size=batch_size, sampler=sampler, num_workers=0
+    )
+    val_loader = DataLoader(
+        real_val, batch_size=batch_size, shuffle=False, num_workers=0
+    )
+
+    return train_loader, val_loader, real_train, real_val
 
 
 def finetune(
     pretrained_path: str,
     real_data_root: str,
-    output_path: str = "finetuned_model.pth",
-    image_size: int = 256,
-    batch_size: int = 16,
-    num_epochs: int = 30,
-    learning_rate: float = 1e-4,
-    weight_decay: float = 1e-5,
+    output_path: str = None,
+    image_size: int = None,
+    batch_size: int = None,
+    num_epochs: int = None,
+    learning_rate: float = None,
+    weight_decay: float = None,
 ):
+    if output_path is None:
+        output_path = str(FINETUNED_MODEL_PATH)
+    if image_size is None:
+        image_size = IMAGE_SIZE
+    if batch_size is None:
+        batch_size = FINETUNE_CONFIG["batch_size"]
+    if num_epochs is None:
+        num_epochs = FINETUNE_CONFIG["num_epochs"]
+    if learning_rate is None:
+        learning_rate = FINETUNE_CONFIG["learning_rate"]
+    if weight_decay is None:
+        weight_decay = FINETUNE_CONFIG["weight_decay"]
+
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 加载预训练模型
-    model = build_model(num_classes=8, pretrained=False).to(DEVICE)
+    model = build_model(num_classes=NUM_CLASSES, pretrained=False).to(DEVICE)
     state_dict = torch.load(pretrained_path, map_location=DEVICE, weights_only=True)
     model.load_state_dict(state_dict)
     print(f"Loaded pretrained model: {pretrained_path}")
 
-    # 创建数据集
-    train_dataset = RealDataDataset(real_data_root, split="train", image_size=image_size)
-    val_dataset = RealDataDataset(real_data_root, split="val", image_size=image_size)
+    # 创建混合数据集
+    train_loader, val_loader, real_train, real_val = create_mixed_dataloader(
+        real_data_root, image_size, batch_size
+    )
 
-    print(f"Real train samples: {len(train_dataset)}")
-    print(f"Real val samples: {len(val_dataset)}")
-    print(f"Class distribution: {train_dataset.get_class_counts()}")
+    print(f"Real train samples: {len(real_train)}")
+    print(f"Real val samples: {len(real_val)}")
+    print(f"Real class distribution: {real_train.get_class_counts()}")
+    print(f"Mixed training batches: {len(train_loader)}")
 
-    if len(train_dataset) == 0:
+    if len(real_train) == 0:
         raise ValueError("No real training data found!")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    # 分层解冻策略：
-    # - 冻结 backbone 底层 (features 0-4)
-    # - 微调 backbone 高层 (features 5-8)
-    # - 完全训练 classifier
-    for name, param in model.backbone.features.named_parameters():
-        block_idx = int(name.split('.')[0]) if name[0].isdigit() else -1
-        if block_idx < 5:
-            param.requires_grad = False
-        else:
-            param.requires_grad = True
-
-    # classifier 始终训练
+    # 初始状态：冻结所有 backbone，仅训练 classifier
+    for param in model.backbone.parameters():
+        param.requires_grad = False
     for param in model.backbone.classifier.parameters():
         param.requires_grad = True
 
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable params: {trainable_params:,} / {total_params:,}")
+    # 冻结 BN
+    freeze_bn(model)
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-    optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                      lr=learning_rate, weight_decay=weight_decay)
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=learning_rate, weight_decay=weight_decay
+    )
     scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-7)
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=FINETUNE_CONFIG["label_smoothing"])
 
     best_val_acc = 0.0
     patience_counter = 0
-    patience = 10
+    patience = FINETUNE_CONFIG["early_stop_patience"]
     min_delta = 0.001
-    best_val_loss = float('inf')
 
     for epoch in range(1, num_epochs + 1):
-        # 训练
+        # ===== 渐进式解冻 =====
+        if epoch == PROGRESSIVE_UNFREEZE["phase1_end"] + 1:
+            print(f"\nPhase 2 (Epoch {epoch}+): Unfreeze blocks 6-7, lr={PROGRESSIVE_UNFREEZE['phase2_lr']}")
+            set_requires_grad_by_block(model, min_block=6)
+            freeze_bn(model)  # 重新冻结 BN
+            optimizer = AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=PROGRESSIVE_UNFREEZE["phase2_lr"], weight_decay=weight_decay
+            )
+            scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - epoch + 1, eta_min=1e-7)
+
+        elif epoch == PROGRESSIVE_UNFREEZE["phase2_end"] + 1:
+            print(f"\nPhase 3 (Epoch {epoch}+): Unfreeze blocks 5-8, lr={PROGRESSIVE_UNFREEZE['phase3_lr']}")
+            set_requires_grad_by_block(model, min_block=5)
+            freeze_bn(model)  # 重新冻结 BN
+            optimizer = AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=PROGRESSIVE_UNFREEZE["phase3_lr"], weight_decay=weight_decay
+            )
+            scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - epoch + 1, eta_min=1e-7)
+
+        # ===== 训练 =====
         model.train()
+        # 确保 BN 保持 eval 模式
+        freeze_bn(model)
+
         train_loss = 0.0
         train_correct = 0
         train_total = 0
@@ -143,7 +219,10 @@ def finetune(
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # 仅裁剪可训练参数
+            torch.nn.utils.clip_grad_norm_(
+                filter(lambda p: p.requires_grad, model.parameters()), 1.0
+            )
             optimizer.step()
 
             train_loss += loss.item() * images.size(0)
@@ -151,9 +230,7 @@ def finetune(
             train_total += labels.size(0)
             train_correct += predicted.eq(labels).sum().item()
 
-        scheduler.step()
-
-        # 验证
+        # ===== 验证 =====
         model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -173,12 +250,15 @@ def finetune(
         val_acc = val_correct / val_total
         avg_val_loss = val_loss / val_total
 
+        # scheduler step 在 optimizer.step 之后
+        scheduler.step()
+
         print(f"Epoch [{epoch}/{num_epochs}] | "
               f"Train: {train_loss/train_total:.4f}/{train_acc:.4f} | "
               f"Val: {avg_val_loss:.4f}/{val_acc:.4f}")
 
-        if avg_val_loss < best_val_loss - min_delta:
-            best_val_loss = avg_val_loss
+        # 统一使用 val_acc 做模型保存和早停
+        if val_acc > best_val_acc + min_delta:
             best_val_acc = val_acc
             patience_counter = 0
             torch.save(model.state_dict(), output_path)
@@ -195,15 +275,15 @@ def finetune(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Finetune on real data")
-    parser.add_argument("--pretrained", type=str, default="best_model.pth",
+    parser.add_argument("--pretrained", type=str, default=str(FINETUNED_MODEL_PATH.parent / "best_model.pth"),
                         help="Path to pretrained model")
-    parser.add_argument("--real-data", type=str, default="dataset_real_labeled",
+    parser.add_argument("--real-data", type=str, default=str(Path.home() / "dataset_real_labeled"),
                         help="Path to labeled real data directory")
-    parser.add_argument("--output", type=str, default="finetuned_model.pth",
+    parser.add_argument("--output", type=str, default=str(FINETUNED_MODEL_PATH),
                         help="Output model path")
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=FINETUNE_CONFIG["num_epochs"])
+    parser.add_argument("--lr", type=float, default=FINETUNE_CONFIG["learning_rate"])
+    parser.add_argument("--batch-size", type=int, default=FINETUNE_CONFIG["batch_size"])
 
     args = parser.parse_args()
 
